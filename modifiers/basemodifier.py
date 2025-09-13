@@ -10,7 +10,7 @@ import aiohttp
 import magic
 import mimetypes
 
-from config import INPUT_DIR
+from config import INPUT_DIR, AUTO_DOWNLOAD_INPUTS
 
 logger = logging.getLogger(__name__)
 
@@ -198,7 +198,8 @@ class BaseModifier:
           
     async def apply_modifications(self):
         """Apply all modifications to the workflow"""
-        await self.replace_workflow_urls(self.workflow)
+        if AUTO_DOWNLOAD_INPUTS:
+            await self.replace_workflow_urls(self.workflow)
             
     async def get_modified_workflow(self):
         """Get the workflow with all modifications applied"""

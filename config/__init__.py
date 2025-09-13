@@ -34,7 +34,9 @@ from .config import (
     REDIS_CONFIG,
     
     # Debug Configuration
-    DEBUG_ENABLED
+    DEBUG_ENABLED,
+    # Feature flags
+    AUTO_DOWNLOAD_INPUTS
 )
 
 __all__ = [
@@ -54,5 +56,6 @@ __all__ = [
     'WEBHOOK_ENABLED',
     'WORKER_CONFIG',
     'REDIS_CONFIG',
-    'DEBUG_ENABLED'
+    'DEBUG_ENABLED',
+    'AUTO_DOWNLOAD_INPUTS'
 ]

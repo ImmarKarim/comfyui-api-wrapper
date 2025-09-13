@@ -77,6 +77,10 @@ REDIS_CONFIG = {
 # Development/Debug Configuration (actually used for debug output)
 DEBUG_ENABLED = os.getenv("DEBUG", "false").lower() == "true"
 
+# Feature flags
+# If false, the wrapper will NOT auto-download input URLs into the ComfyUI input folder
+AUTO_DOWNLOAD_INPUTS = os.getenv("AUTO_DOWNLOAD_INPUTS", "false").lower() == "true"
+
 # Print configuration summary if debug enabled
 if DEBUG_ENABLED:
     print("🔧 Configuration Summary:")
@@ -85,6 +89,7 @@ if DEBUG_ENABLED:
     print(f"   Workers: {WORKER_CONFIG['preprocess_workers']}/{WORKER_CONFIG['generation_workers']}/{WORKER_CONFIG['postprocess_workers']}")
     print(f"   S3 Enabled: {S3_ENABLED}")
     print(f"   Webhook Enabled: {WEBHOOK_ENABLED}")
+    print(f"   Auto Download Inputs: {AUTO_DOWNLOAD_INPUTS}")
     if os.path.exists('.env'):
         print("   📄 .env file loaded")
     else:
