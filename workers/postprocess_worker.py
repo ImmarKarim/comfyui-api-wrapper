@@ -169,13 +169,34 @@ class PostprocessWorker:
                 
                 logger.debug(f"Processing node {node_id} outputs: {list(node_outputs.keys())}")
                 
-                # Look for different output types (images, gifs, videos, etc.)
-                for output_type, output_list in node_outputs.items():
+                # Prefer 'files' over 'images' if both exist
+                # 'files' contains only actual outputs from this job
+                # 'images' may contain history from previous jobs
+                output_types_to_process = []
+                if 'files' in node_outputs:
+                    logger.info(f"Node {node_id}: Using 'files' array (actual job outputs)")
+                    output_types_to_process.append('files')
+                    # Process other types except 'images' to avoid duplicates
+                    for key in node_outputs.keys():
+                        if key not in ['images', 'files']:
+                            output_types_to_process.append(key)
+                else:
+                    # No 'files' array, process all output types including 'images'
+                    output_types_to_process = list(node_outputs.keys())
+                
+                # Look for different output types (images, gifs, videos, files, etc.)
+                for output_type in output_types_to_process:
+                    output_list = node_outputs.get(output_type)
                     if not isinstance(output_list, list):
                         logger.debug(f"Skipping non-list output type {output_type} in node {node_id}")
                         continue
                     
                     for item in output_list:
+                        # Handle both dict format and string format (files can be paths)
+                        if isinstance(item, str):
+                            # Convert string path to dict format
+                            item = {"filename": Path(item).name, "subfolder": "", "type": "output"}
+                        
                         if isinstance(item, dict) and 'filename' in item:
                             # Skip preview/temp files
                             file_type = item.get('type', '')
@@ -239,6 +260,26 @@ class PostprocessWorker:
             
             # Get the real path (in case original_path is a symlink from a cached result)
             real_original_path = original_path.resolve()
+
+            # Defensive guard: only allow copying if source is either a top-level file
+            # directly under OUTPUT_DIR, or within a subdirectory whose first segment
+            # matches the full request_id (which may contain slashes).
+            try:
+                rel = real_original_path.relative_to(self.output_dir)
+                rel_parts = rel.parts
+                # Allow top-level files (e.g., YY00001_0084.png)
+                if len(rel_parts) == 1:
+                    pass
+                # Allow when the path starts with request_id directory
+                elif rel_parts[0] == str(request_id):
+                    pass
+                else:
+                    logger.debug(f"Skipping source from different request directory: {real_original_path}")
+                    return None
+            except Exception:
+                # If not under OUTPUT_DIR, proceed (should not happen normally)
+                pass
+            
             
             logger.info(f"Copying {real_original_path} to {dest_path}")
             
