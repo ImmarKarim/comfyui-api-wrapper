@@ -3,6 +3,7 @@ import asyncio
 import aiohttp
 import json
 import logging
+import random
 from typing import Optional, Dict, Any
 from datetime import datetime
 
@@ -142,47 +143,72 @@ class GenerationWorker:
         
         timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
         
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            try:
-                logger.debug(f"Posting workflow to {COMFYUI_API_PROMPT}")
-                logger.debug(f"Workflow keys: {list(request.input.workflow_json.keys()) if isinstance(request.input.workflow_json, dict) else 'not a dict'}")
-                
-                async with session.post(
-                    COMFYUI_API_PROMPT, 
-                    data=json.dumps(payload),
-                    headers=headers
-                ) as response:
+        max_attempts = 4
+        base_delay_seconds = 0.5
+        last_error: Optional[Exception] = None
+        
+        for attempt in range(1, max_attempts + 1):
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                try:
+                    logger.debug(f"Posting workflow to {COMFYUI_API_PROMPT} (attempt {attempt}/{max_attempts})")
+                    logger.debug(f"Workflow keys: {list(request.input.workflow_json.keys()) if isinstance(request.input.workflow_json, dict) else 'not a dict'}")
                     
-                    response_text = await response.text()
-                    logger.debug(f"ComfyUI API response status: {response.status}")
-                    logger.debug(f"ComfyUI API response: {response_text[:500]}...")  # First 500 chars
-                    
-                    if response.status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            request_info=response.request_info,
-                            history=response.history,
-                            status=response.status,
-                            message=f"ComfyUI API error: {response_text}"
-                        )
-                    
-                    response_data = json.loads(response_text)
-                    
-                    if "prompt_id" in response_data:
-                        return response_data["prompt_id"]
-                    elif "node_errors" in response_data:
-                        error_details = json.dumps(response_data["node_errors"], indent=2)
-                        raise Exception(f"ComfyUI node errors: {error_details}")
-                    elif "error" in response_data:
-                        raise Exception(f"ComfyUI error: {response_data['error']}")
-                    else:
-                        raise Exception(f"Unexpected response from ComfyUI: {response_data}")
+                    async with session.post(
+                        COMFYUI_API_PROMPT, 
+                        data=json.dumps(payload),
+                        headers=headers
+                    ) as response:
                         
-            except asyncio.TimeoutError:
-                raise Exception("Timeout posting workflow to ComfyUI")
-            except aiohttp.ClientError as e:
-                raise Exception(f"Network error posting to ComfyUI: {e}")
-            except json.JSONDecodeError as e:
-                raise Exception(f"Invalid JSON response from ComfyUI: {e}")
+                        response_text = await response.text()
+                        logger.debug(f"ComfyUI API response status: {response.status}")
+                        logger.debug(f"ComfyUI API response: {response_text[:500]}...")  # First 500 chars
+                        
+                        if response.status >= 400:
+                            # Treat HTTP errors as non-retryable here; raise immediately
+                            raise aiohttp.ClientResponseError(
+                                request_info=response.request_info,
+                                history=response.history,
+                                status=response.status,
+                                message=f"ComfyUI API error: {response_text}"
+                            )
+                        
+                        response_data = json.loads(response_text)
+                        
+                        if "prompt_id" in response_data:
+                            return response_data["prompt_id"]
+                        elif "node_errors" in response_data:
+                            error_details = json.dumps(response_data["node_errors"], indent=2)
+                            raise Exception(f"ComfyUI node errors: {error_details}")
+                        elif "error" in response_data:
+                            raise Exception(f"ComfyUI error: {response_data['error']}")
+                        else:
+                            raise Exception(f"Unexpected response from ComfyUI: {response_data}")
+                except (asyncio.TimeoutError, aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as e:
+                    last_error = e
+                    if attempt >= max_attempts:
+                        raise Exception(f"Network error posting to ComfyUI: {e}")
+                    # Exponential backoff with jitter
+                    backoff_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, base_delay_seconds)
+                    sleep_for = backoff_seconds + jitter
+                    logger.warning(f"post_workflow attempt {attempt} failed with network error: {e}. Retrying in {sleep_for:.2f}s")
+                    await asyncio.sleep(sleep_for)
+                except aiohttp.ClientResponseError as e:
+                    # Non-retryable HTTP error
+                    raise Exception(f"ComfyUI API error (HTTP {e.status}): {e.message}")
+                except aiohttp.ClientError as e:
+                    # Other aiohttp errors considered network-related; retry
+                    last_error = e
+                    if attempt >= max_attempts:
+                        raise Exception(f"Network error posting to ComfyUI: {e}")
+                    backoff_seconds = base_delay_seconds * (2 ** (attempt - 1))
+                    jitter = random.uniform(0, base_delay_seconds)
+                    sleep_for = backoff_seconds + jitter
+                    logger.warning(f"post_workflow attempt {attempt} failed: {e}. Retrying in {sleep_for:.2f}s")
+                    await asyncio.sleep(sleep_for)
+                except json.JSONDecodeError as e:
+                    # Parsing error is unlikely to be resolved by retrying; raise
+                    raise Exception(f"Invalid JSON response from ComfyUI: {e}")
 
     async def check_if_cached(self, comfyui_job_id: str) -> bool:
         """Check if job is already complete (cached result)"""
