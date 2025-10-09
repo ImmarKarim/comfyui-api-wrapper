@@ -352,7 +352,12 @@ async def generate(
 # ===== SYNCHRONOUS ENDPOINT =====
 @asynccontextmanager
 async def cancel_on_disconnect(request: Request, request_id: str):
-    """Cancel work if the client disconnects prematurely."""
+    """
+    Cancel work if the client disconnects prematurely.
+    
+    IMPORTANT: If webhook is configured, DON'T cancel - continue processing
+    and send results via webhook.
+    """
     async with create_task_group() as tg:
         async def watch_disconnect():
             try:
@@ -361,9 +366,39 @@ async def cancel_on_disconnect(request: Request, request_id: str):
                     if message["type"] == "http.disconnect":
                         client = f'{request.client.host}:{request.client.port}' if request.client else '-:-'
                         logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}')
-                        await _mark_request_cancelled(request_id)
-                        tg.cancel_scope.cancel()
-                        break
+                        
+                        # Check if webhook is configured in the request payload
+                        try:
+                            payload = await request_store.get(request_id)
+                            has_webhook = False
+                            
+                            if payload and hasattr(payload, 'input'):
+                                # Check if webhook is configured
+                                if hasattr(payload.input, 'webhook') and payload.input.webhook:
+                                    has_webhook = payload.input.webhook.has_valid_url()
+                            
+                            if has_webhook:
+                                # Webhook configured - DON'T cancel processing
+                                logger.info(
+                                    f'{client} - Request {request_id} disconnected but webhook configured '
+                                    f'(url: {payload.input.webhook.url}). Continuing processing, will send webhook when done.'
+                                )
+                                # Just break out of loop, don't cancel the scope
+                                break
+                            else:
+                                # No webhook - cancel as before
+                                logger.info(f'{client} - Request {request_id} disconnected with no webhook. Cancelling processing.')
+                                await _mark_request_cancelled(request_id)
+                                tg.cancel_scope.cancel()
+                                break
+                                
+                        except Exception as e:
+                            # If we can't check webhook config, err on the side of cancelling
+                            logger.warning(f'Error checking webhook config for {request_id}: {e}. Cancelling to be safe.')
+                            await _mark_request_cancelled(request_id)
+                            tg.cancel_scope.cancel()
+                            break
+                            
             except asyncio.CancelledError:
                 # Task cancelled by scope exit — swallow it
                 pass
