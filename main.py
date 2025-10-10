@@ -350,6 +350,10 @@ async def generate(
         return failed_result
 
 # ===== SYNCHRONOUS ENDPOINT =====
+class DisconnectWithWebhook(Exception):
+    """Raised when client disconnects but webhook is configured"""
+    pass
+
 @asynccontextmanager
 async def cancel_on_disconnect(request: Request, request_id: str):
     """
@@ -383,8 +387,9 @@ async def cancel_on_disconnect(request: Request, request_id: str):
                                     f'{client} - Request {request_id} disconnected but webhook configured '
                                     f'(url: {payload.input.webhook.url}). Continuing processing, will send webhook when done.'
                                 )
-                                # Just break out of loop, don't cancel the scope
-                                break
+                                # Signal that we should return early with webhook message
+                                tg.cancel_scope.cancel()
+                                raise DisconnectWithWebhook(f"Client disconnected but webhook configured for {request_id}")
                             else:
                                 # No webhook - cancel as before
                                 logger.info(f'{client} - Request {request_id} disconnected with no webhook. Cancelling processing.')
@@ -392,6 +397,9 @@ async def cancel_on_disconnect(request: Request, request_id: str):
                                 tg.cancel_scope.cancel()
                                 break
                                 
+                        except DisconnectWithWebhook:
+                            # Re-raise to outer handler
+                            raise
                         except Exception as e:
                             # If we can't check webhook config, err on the side of cancelling
                             logger.warning(f'Error checking webhook config for {request_id}: {e}. Cancelling to be safe.')
@@ -439,6 +447,14 @@ async def generate_sync(
                     return result
                 await asyncio.sleep(0.5)
 
+    except DisconnectWithWebhook:
+        # Client disconnected but webhook is configured - continue processing in background
+        response.status_code = 202
+        return Result(
+            id=request_id,
+            status="accepted",
+            message="Client disconnected. Processing continues in background. Results will be sent to configured webhook."
+        )
     except asyncio.CancelledError:
         # Clean return instead of exception bubble
         return JSONResponse(
@@ -745,6 +761,7 @@ async def cancel_request_simple(
     except Exception as e:
         logger.error(f"Failed to cancel request {request_id}: {e}")
         response.status_code = 500
+        return {"error": f"Failed to cancel request: {str(e)}"}
 
 @app.get('/queue-info', response_model=dict)
 async def queue_info():
