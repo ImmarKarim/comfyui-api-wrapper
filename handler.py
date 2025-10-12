@@ -16,9 +16,12 @@ from workers.postprocess_worker import PostprocessWorker
 logger = logging.getLogger(__name__)
 
 
-async def process_event(event: dict) -> dict:
-    """Run a single end-to-end generation using the existing worker pipeline.
+async def handler(event: dict):
+    """Runpod async handler: execute the full generation pipeline.
 
+    Runpod's serverless SDK natively supports async handlers, so we can
+    directly define this as async and avoid asyncio.run() entirely.
+    
     Expects event["input"] to match the API's Payload schema. If the provided
     input is already the inner object, we wrap it accordingly.
     """
@@ -103,10 +106,6 @@ async def process_event(event: dict) -> dict:
         return final_result.model_dump()
     # Fallback
     return {"id": request_id, "status": "failed", "message": "No result available"}
-
-
-def handler(event: dict):
-    return asyncio.run(process_event(event))
 
 
 runpod.serverless.start({"handler": handler})
