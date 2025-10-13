@@ -432,7 +432,7 @@ class PostprocessWorker:
         """Send webhook notification with result"""
         try:
             timeout = aiohttp.ClientTimeout(total=30)
-            
+
             # Prepare webhook payload
             webhook_data = {
                 "id": result.id,
@@ -440,23 +440,62 @@ class PostprocessWorker:
                 "message": result.message,
                 "output": getattr(result, 'output', [])
             }
-            
+
             # Add extra parameters if provided
             if extra_params:
                 webhook_data.update(extra_params)
-            
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    webhook_url,
-                    json=webhook_data,
-                    headers={'Content-Type': 'application/json'}
-                ) as response:
-                    if response.status >= 400:
-                        error_text = await response.text()
-                        logger.warning(f"Webhook failed (status {response.status}): {error_text}")
-                    else:
-                        logger.info(f"Webhook sent successfully to {webhook_url}")
-                        
+
+            # Retry policy: retry on 5xx and 429, not on 4xx (client errors)
+            max_attempts = 4
+            base_delay = 0.5
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    # Force identity encoding to avoid zstd issues on some servers
+                    headers = {
+                        'Content-Type': 'application/json',
+                        'Accept-Encoding': 'identity'
+                    }
+
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(
+                            webhook_url,
+                            json=webhook_data,
+                            headers=headers
+                        ) as response:
+                            if response.status < 400:
+                                logger.info(f"Webhook sent successfully to {webhook_url}")
+                                return
+
+                            # Try to get a safe error preview without decoding compressed encodings
+                            error_text = None
+                            try:
+                                # Use read() to get raw bytes; decode best-effort
+                                raw = await response.read()
+                                error_text = raw[:512].decode('utf-8', errors='replace') if raw else ''
+                            except Exception:
+                                error_text = ''
+
+                            logger.warning(
+                                f"Webhook failed (status {response.status}) on attempt {attempt}/{max_attempts}: {error_text}"
+                            )
+
+                            # Do not retry 4xx except 429 (client errors)
+                            if response.status >= 400 and response.status < 500 and response.status != 429:
+                                return
+
+                except aiohttp.ClientError as e:
+                    # Network-related error; fall through to retry
+                    logger.warning(f"Webhook network error on attempt {attempt}/{max_attempts}: {e}")
+
+                # Backoff before next attempt
+                if attempt < max_attempts:
+                    delay = min(base_delay * (2 ** (attempt - 1)), 5.0)
+                    await asyncio.sleep(delay)
+
+            # After retries exhausted
+            logger.error(f"Webhook delivery failed after {max_attempts} attempts to {webhook_url}")
+
         except Exception as e:
             logger.error(f"Error sending webhook to {webhook_url}: {e}")
             # Don't raise - webhook failures shouldn't fail the whole job
