@@ -28,6 +28,7 @@ class GenerationWorker:
         self.max_wait_time = 3600  # 1 hour maximum wait
         self.ws_url = COMFYUI_API_WEBSOCKET
         self.client_id = f"worker_{worker_id}_{datetime.now().timestamp()}"
+        self._comfy_ready = False
 
     async def work(self):
         logger.info(f"GenerationWorker {self.worker_id}: waiting for jobs")
@@ -57,7 +58,12 @@ class GenerationWorker:
                     await self.postprocess_queue.put(request_id)
                     self.generation_queue.task_done()
                     continue
-                    
+
+                # Ensure ComfyUI is up before posting the workflow (handles cold start)
+                if not self._comfy_ready:
+                    await self.wait_for_comfy_ready()
+                    self._comfy_ready = True
+
                 # Submit workflow to ComfyUI
                 comfyui_job_id = await self.post_workflow(request)
                 logger.info(f"Submitted job {request_id} to ComfyUI as {comfyui_job_id}")
@@ -130,6 +136,53 @@ class GenerationWorker:
 
         logger.info(f"GenerationWorker {self.worker_id} finished")
 
+    async def wait_for_comfy_ready(self, max_wait_seconds: int = 120) -> None:
+        """Wait until ComfyUI HTTP and WebSocket endpoints are reachable.
+
+        This mitigates race conditions where the wrapper starts before ComfyUI.
+        """
+        start = asyncio.get_event_loop().time()
+        attempt = 0
+        http_ok = False
+        ws_ok = False
+
+        # Use small timeouts to keep loop responsive
+        http_timeout = aiohttp.ClientTimeout(total=2.0)
+
+        while True:
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > max_wait_seconds:
+                raise Exception(f"ComfyUI not ready after {max_wait_seconds}s")
+
+            attempt += 1
+            try:
+                # Check HTTP readiness via history endpoint
+                async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                    async with session.get(COMFYUI_API_HISTORY) as resp:
+                        if resp.status in (200, 404):
+                            http_ok = True
+                        else:
+                            http_ok = False
+            except Exception:
+                http_ok = False
+
+            try:
+                # Check WebSocket readiness with a lightweight probe
+                async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                    async with session.ws_connect(self.ws_url, params={"clientId": "healthcheck"}) as ws:
+                        ws_ok = True
+            except Exception:
+                ws_ok = False
+
+            if http_ok and ws_ok:
+                logger.info("ComfyUI is ready (HTTP and WebSocket reachable)")
+                return
+
+            # Exponential backoff with cap
+            backoff = min(0.5 * (2 ** min(attempt, 5)), 3.0)
+            logger.info(f"Waiting for ComfyUI to be ready (attempt {attempt}) - retrying in {backoff:.1f}s")
+            await asyncio.sleep(backoff)
+
     async def post_workflow(self, request) -> str:
         """Submit workflow to ComfyUI API"""
         payload = {
@@ -143,8 +196,8 @@ class GenerationWorker:
         
         timeout = aiohttp.ClientTimeout(total=30)  # 30 second timeout
         
-        max_attempts = 4
-        base_delay_seconds = 0.5
+        max_attempts = 5
+        base_delay_seconds = 1
         last_error: Optional[Exception] = None
         
         for attempt in range(1, max_attempts + 1):
