@@ -316,7 +316,7 @@ class GenerationWorker:
                     
                     # Progressive timeout strategy
                     initial_timeout = 300.0  # 30 seconds to receive first message
-                    message_timeout = 600.0  # 300 seconds between messages after first message received
+                    message_timeout = 800.0  # 300 seconds between messages after first message received
                     max_no_message_retries = 3  # Number of times to retry when no messages received
                     no_message_retry_count = 0
                     
