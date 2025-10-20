@@ -16,6 +16,7 @@ from anyio import create_task_group
 from aiocache import Cache, SimpleMemoryCache
 import time
 import aiofiles
+import aiohttp
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED
 from requestmodels.models import Payload
