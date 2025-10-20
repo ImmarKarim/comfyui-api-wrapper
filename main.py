@@ -774,14 +774,119 @@ async def queue_info():
 
 
 @app.get('/health', response_model=dict)
-async def health():
-    """Health check endpoint"""
-    return {
+async def health(response: Response):
+    """Health check endpoint - verifies ComfyUI accessibility"""
+    health_status = {
         "status": "healthy",
         "cache_type": CACHE_TYPE,
         "queues": {
             "preprocess": preprocess_queue.qsize(),
             "generation": generation_queue.qsize(), 
             "postprocess": postprocess_queue.qsize(),
+        },
+        "comfyui": {
+            "accessible": False,
+            "http_ok": False,
+            "websocket_ok": False,
+            "message": ""
         }
+    }
+    
+    try:
+        # Check ComfyUI accessibility with retries
+        comfyui_status = await check_comfyui_health(max_retries=3)
+        health_status["comfyui"] = comfyui_status
+        
+        if not comfyui_status["accessible"]:
+            health_status["status"] = "unhealthy"
+            response.status_code = 503  # Service Unavailable
+            
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        health_status["status"] = "unhealthy"
+        health_status["comfyui"]["message"] = f"Health check error: {str(e)}"
+        response.status_code = 503
+    
+    return health_status
+
+
+async def check_comfyui_health(max_retries: int = 3) -> dict:
+    """
+    Check if ComfyUI is accessible by testing HTTP and WebSocket endpoints.
+    Returns status dict with accessibility information.
+    """
+    from config import COMFYUI_API_HISTORY, COMFYUI_API_WEBSOCKET
+    
+    http_timeout = aiohttp.ClientTimeout(total=2.0)
+    http_ok = False
+    ws_ok = False
+    last_error = None
+    
+    for attempt in range(1, max_retries + 1):
+        try:
+            # Check HTTP readiness via history endpoint
+            async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                try:
+                    async with session.get(COMFYUI_API_HISTORY) as resp:
+                        if resp.status in (200, 404):
+                            http_ok = True
+                        else:
+                            http_ok = False
+                            last_error = f"HTTP returned status {resp.status}"
+                except Exception as e:
+                    http_ok = False
+                    last_error = f"HTTP connection failed: {str(e)}"
+            
+            # Check WebSocket readiness
+            try:
+                async with aiohttp.ClientSession(timeout=http_timeout) as session:
+                    async with session.ws_connect(
+                        COMFYUI_API_WEBSOCKET, 
+                        params={"clientId": "healthcheck"}
+                    ) as ws:
+                        ws_ok = True
+                        # Close gracefully
+                        await ws.close()
+            except Exception as e:
+                ws_ok = False
+                last_error = f"WebSocket connection failed: {str(e)}"
+            
+            # If both are OK, ComfyUI is accessible
+            if http_ok and ws_ok:
+                logger.debug(f"ComfyUI health check passed (attempt {attempt}/{max_retries})")
+                return {
+                    "accessible": True,
+                    "http_ok": True,
+                    "websocket_ok": True,
+                    "message": "ComfyUI is accessible",
+                    "attempts": attempt
+                }
+            
+            # If not last attempt, wait before retrying
+            if attempt < max_retries:
+                backoff = 0.5 * attempt  # Linear backoff: 0.5s, 1s, 1.5s
+                logger.warning(
+                    f"ComfyUI health check attempt {attempt}/{max_retries} failed "
+                    f"(http_ok={http_ok}, ws_ok={ws_ok}). Retrying in {backoff}s..."
+                )
+                await asyncio.sleep(backoff)
+                
+        except Exception as e:
+            last_error = str(e)
+            logger.warning(f"ComfyUI health check attempt {attempt}/{max_retries} error: {e}")
+            if attempt < max_retries:
+                await asyncio.sleep(0.5 * attempt)
+    
+    # All retries failed
+    logger.error(
+        f"ComfyUI health check failed after {max_retries} attempts. "
+        f"Final status: http_ok={http_ok}, ws_ok={ws_ok}"
+    )
+    
+    return {
+        "accessible": False,
+        "http_ok": http_ok,
+        "websocket_ok": ws_ok,
+        "message": f"ComfyUI not accessible after {max_retries} attempts. Last error: {last_error}",
+        "attempts": max_retries
     }
