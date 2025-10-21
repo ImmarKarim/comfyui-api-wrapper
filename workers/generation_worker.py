@@ -673,6 +673,7 @@ def _detect_cuda_unrecoverable_reason(text: str) -> str:
             "cuda error: an illegal memory access was encountered",
             "triton error [cuda]",
             "cuda runtime error",
+            "triton error [cuda]: unspecified launch failure",
         ]
         for phrase in triggers:
             if phrase in lowered:
