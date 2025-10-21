@@ -20,6 +20,7 @@ import aiohttp
 import subprocess
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED
+from metrics import get_consecutive_failures
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -829,6 +830,13 @@ async def health(response: Response):
         health_status["comfyui"]["message"] = f"Health check error: {str(e)}"
         response.status_code = 503
     
+    # Fail health if we have consecutive generation failures >= threshold
+    consecutive_failures = get_consecutive_failures()
+    health_status["consecutive_failures"] = consecutive_failures
+    if consecutive_failures >= 2:
+        health_status["status"] = "unhealthy"
+        response.status_code = 503
+
     return health_status
 
 

@@ -8,6 +8,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
+from metrics import record_generation_outcome
 
 logger = logging.getLogger(__name__)
 
@@ -109,12 +110,17 @@ class GenerationWorker:
                         result.comfyui_response["execution_details"] = execution_result
                 await self.response_store.set(request_id, result)
                 
+                # Record success for health metrics
+                record_generation_outcome(True)
+
                 # Send for post-processing
                 await self.postprocess_queue.put(request_id)
                 logger.info(f"GenerationWorker {self.worker_id} completed job: {request_id}")
                 
             except Exception as e:
                 logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
+                # Record failure for health metrics
+                record_generation_outcome(False)
                 
                 try:
                     # Update result to show failure
@@ -315,7 +321,7 @@ class GenerationWorker:
                     last_cancellation_check = start_time
                     
                     # Progressive timeout strategy
-                    initial_timeout = 300.0  # 30 seconds to receive first message
+                    initial_timeout = 180.0  # 30 seconds to receive first message
                     message_timeout = 800.0  # 300 seconds between messages after first message received
                     max_no_message_retries = 3  # Number of times to retry when no messages received
                     no_message_retry_count = 0
