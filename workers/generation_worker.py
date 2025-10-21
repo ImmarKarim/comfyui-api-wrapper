@@ -121,6 +121,14 @@ class GenerationWorker:
                 logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
                 # Record failure for health metrics
                 record_generation_outcome(False)
+                # Best-effort detection for unrecoverable CUDA errors even if not from websocket path
+                try:
+                    reason = _detect_cuda_unrecoverable_reason(str(e))
+                    if reason:
+                        mark_gpu_unrecoverable(reason)
+                        logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
+                except Exception:
+                    pass
                 
                 try:
                     # Update result to show failure
@@ -221,6 +229,15 @@ class GenerationWorker:
                         response_text = await response.text()
                         logger.debug(f"ComfyUI API response status: {response.status}")
                         logger.debug(f"ComfyUI API response: {response_text[:500]}...")  # First 500 chars
+
+                        # Detect unrecoverable CUDA errors even if HTTP succeeded
+                        try:
+                            reason = _detect_cuda_unrecoverable_reason(response_text)
+                            if reason:
+                                mark_gpu_unrecoverable(reason)
+                                logger.error(f"Marked GPU as unrecoverable from post_workflow response: {reason}")
+                        except Exception:
+                            pass
                         
                         if response.status >= 400:
                             # Treat HTTP errors as non-retryable here; raise immediately
@@ -237,8 +254,24 @@ class GenerationWorker:
                             return response_data["prompt_id"]
                         elif "node_errors" in response_data:
                             error_details = json.dumps(response_data["node_errors"], indent=2)
+                            # Detection from structured node_errors
+                            try:
+                                reason = _detect_cuda_unrecoverable_reason(error_details)
+                                if reason:
+                                    mark_gpu_unrecoverable(reason)
+                                    logger.error(f"Marked GPU as unrecoverable from node_errors: {reason}")
+                            except Exception:
+                                pass
                             raise Exception(f"ComfyUI node errors: {error_details}")
                         elif "error" in response_data:
+                            # Detection from top-level error field
+                            try:
+                                reason = _detect_cuda_unrecoverable_reason(str(response_data["error"]))
+                                if reason:
+                                    mark_gpu_unrecoverable(reason)
+                                    logger.error(f"Marked GPU as unrecoverable from error field: {reason}")
+                            except Exception:
+                                pass
                             raise Exception(f"ComfyUI error: {response_data['error']}")
                         else:
                             raise Exception(f"Unexpected response from ComfyUI: {response_data}")
@@ -561,6 +594,14 @@ class GenerationWorker:
                 async with session.get(url) as response:
                     response_text = await response.text()
                     logger.debug(f"History API status: {response.status}")
+                    # Detect unrecoverable CUDA errors from history body
+                    try:
+                        reason = _detect_cuda_unrecoverable_reason(response_text)
+                        if reason:
+                            mark_gpu_unrecoverable(reason)
+                            logger.error(f"Marked GPU as unrecoverable from history response: {reason}")
+                    except Exception:
+                        pass
                     
                     if response.status == 200:
                         history_data = json.loads(response_text)
@@ -600,7 +641,16 @@ class GenerationWorker:
                         # Look for our job in the history
                         if comfyui_job_id in all_history:
                             logger.info(f"Found job {comfyui_job_id} in general history")
-                            return {comfyui_job_id: all_history[comfyui_job_id]}
+                            job_blob = {comfyui_job_id: all_history[comfyui_job_id]}
+                            # Detect unrecoverable CUDA errors from general history
+                            try:
+                                reason = _detect_cuda_unrecoverable_reason(json.dumps(job_blob))
+                                if reason:
+                                    mark_gpu_unrecoverable(reason)
+                                    logger.error(f"Marked GPU as unrecoverable from general history: {reason}")
+                            except Exception:
+                                pass
+                            return job_blob
                         else:
                             logger.warning(f"Job {comfyui_job_id} not found in general history")
                             return {}
