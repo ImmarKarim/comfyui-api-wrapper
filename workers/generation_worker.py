@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime
 
 from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
-from metrics import record_generation_outcome
+from metrics import record_generation_outcome, mark_gpu_unrecoverable
 
 logger = logging.getLogger(__name__)
 
@@ -412,6 +412,16 @@ class GenerationWorker:
                                             error_data = data.get("data", {})
                                             error_msg = f"Execution error: {error_data}"
                                             logger.error(error_msg)
+                                            # Try to detect unrecoverable CUDA failures and mark sticky flag
+                                            try:
+                                                combined = json.dumps(error_data)
+                                                reason = _detect_cuda_unrecoverable_reason(combined)
+                                                if reason:
+                                                    mark_gpu_unrecoverable(reason)
+                                                    logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
+                                            except Exception:
+                                                # Best-effort detection; ignore secondary errors
+                                                pass
                                             execution_result["error"] = error_data
                                             raise Exception(error_msg)
                                         
@@ -516,6 +526,14 @@ class GenerationWorker:
             logger.error(f"WebSocket error for job {comfyui_job_id}: {e}")
             # Cancel on other errors to be safe
             await self.cancel_comfyui_job(comfyui_job_id)
+            # Attempt detection from exception text too
+            try:
+                reason = _detect_cuda_unrecoverable_reason(str(e))
+                if reason:
+                    mark_gpu_unrecoverable(reason)
+                    logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
+            except Exception:
+                pass
             raise
 
     async def _update_progress(self, request_id: str, message: str):
@@ -638,3 +656,28 @@ class GenerationWorker:
         except Exception as e:
             logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}")
             return False
+def _detect_cuda_unrecoverable_reason(text: str) -> str:
+    """Detects CUDA launch failure or similar GPU fatal errors from text.
+
+    Returns a non-empty reason string if an unrecoverable GPU issue is detected; otherwise empty string.
+    """
+    try:
+        lowered = text.lower()
+        # Common strings to detect unrecoverable GPU failures
+        triggers = [
+            "unspecified launch failure",
+            "cuda error: unspecified launch failure",
+            "cuda error",
+            "cuda error: device-side assert triggered",
+            "illegal memory access",
+            "cuda error: an illegal memory access was encountered",
+            "triton error [cuda]",
+            "cuda runtime error",
+        ]
+        for phrase in triggers:
+            if phrase in lowered:
+                return phrase
+        return ""
+    except Exception:
+        return ""
+

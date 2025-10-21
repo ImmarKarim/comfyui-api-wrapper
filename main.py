@@ -20,7 +20,7 @@ import aiohttp
 import subprocess
 
 from config import CACHE_TYPE, WORKER_CONFIG, DEBUG_ENABLED
-from metrics import get_consecutive_failures
+from metrics import get_consecutive_failures, is_gpu_unrecoverable, get_gpu_unrecoverable_reason
 from requestmodels.models import Payload
 from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
@@ -795,6 +795,15 @@ async def health(response: Response):
         }
     }
     
+    # Fail health if we previously detected an unrecoverable GPU error
+    if is_gpu_unrecoverable():
+        reason = get_gpu_unrecoverable_reason()
+        health_status["status"] = "unhealthy"
+        health_status["gpu_unrecoverable"] = True
+        health_status["gpu_reason"] = reason
+        response.status_code = 503
+        return health_status
+
     # Simple NVIDIA driver check: fail health if nvidia-smi is not working
     try:
         driver_proc = subprocess.run(
