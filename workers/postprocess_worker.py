@@ -5,6 +5,7 @@ import os  # Still needed for symlink and remove operations
 import shutil
 from pathlib import Path
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 import json
 
 import aiobotocore.session
@@ -377,17 +378,17 @@ class PostprocessWorker:
                 
                 # Wait for all uploads
                 if tasks:
-                    presigned_urls = await asyncio.gather(*tasks, return_exceptions=True)
+                    upload_urls = await asyncio.gather(*tasks, return_exceptions=True)
                     
-                    # Update result objects with URLs
-                    for obj, url_result in zip(result.output, presigned_urls):
+                    # Update result objects with URLs (may be permanent direct URLs or 7-day presigned URLs)
+                    for obj, url_result in zip(result.output, upload_urls):
                         if isinstance(url_result, Exception):
                             logger.error(f"Upload failed for {obj.get('local_path')}: {url_result}")
                             obj["upload_error"] = str(url_result)
                         elif url_result:
                             obj["url"] = url_result
                             
-                    logger.info(f"Uploaded {len([u for u in presigned_urls if u and not isinstance(u, Exception)])} assets for {request_id}")
+                    logger.info(f"Uploaded {len([u for u in upload_urls if u and not isinstance(u, Exception)])} assets for {request_id}")
                     
         except Exception as e:
             logger.error(f"Error uploading assets for {request_id}: {e}")
@@ -398,35 +399,78 @@ class PostprocessWorker:
         return None
 
     async def upload_file_and_get_url(self, request_id: str, s3_client, bucket_name: str, local_path: str) -> Optional[str]:
-        """Upload single file and return presigned URL"""
+        """Upload a single file. Prefer returning a public direct URL (never expires)
+        by attempting ACL='public-read' first. Uses presigned URL generation for 
+        provider-agnostic URL formatting, then strips query params for public objects.
+        Falls back to full presigned URL (7-day expiry) if public access not available.
+        """
         try:
             file_path = Path(local_path)
             s3_key = f"{request_id}/{file_path.name}"
             
             logger.debug(f"Uploading {s3_key} to bucket {bucket_name}")
 
-            # Upload file
+            # Read file content once
             async with aiofiles.open(local_path, 'rb') as file:
                 file_content = await file.read()
+
+            # 1) Try public upload using ACL='public-read' (may fail if bucket blocks public ACLs)
+            uploaded_public = False
+            try:
                 await s3_client.put_object(
-                    Bucket=bucket_name, 
-                    Key=s3_key, 
+                    Bucket=bucket_name,
+                    Key=s3_key,
+                    Body=file_content,
+                    ACL='public-read'
+                )
+                uploaded_public = True
+                logger.debug(f"Uploaded {s3_key} with public-read ACL")
+            except Exception as acl_error:
+                logger.info(f"Public ACL upload not permitted, falling back to private object: {acl_error}")
+                # 2) Upload privately without ACL
+                await s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=s3_key,
                     Body=file_content
                 )
 
-            # Generate presigned URL
+            # 3) Generate presigned URL (S3 client handles all provider-specific URL formatting)
             presigned_url = await s3_client.generate_presigned_url(
                 'get_object',
                 Params={'Bucket': bucket_name, 'Key': s3_key},
                 ExpiresIn=604800  # 7 days
             )
-            
-            logger.debug(f"Generated presigned URL for {s3_key}")
+
+            # 4) If uploaded as public, strip query params to get permanent direct URL
+            if uploaded_public:
+                parsed = urlparse(presigned_url)
+                # Direct URL = base URL without query parameters (never expires)
+                direct_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                
+                # Verify the direct URL is actually accessible
+                if await self._url_is_public(direct_url):
+                    logger.info(f"Returning permanent public URL for {s3_key}")
+                    return direct_url
+                else:
+                    logger.info(f"Direct URL not accessible (ACL may not have applied), using presigned URL")
+
+            # 5) Fallback: Return full presigned URL with expiration
+            logger.debug(f"Returning presigned URL (7-day expiry) for {s3_key}")
             return presigned_url
             
         except Exception as e:
             logger.error(f"Error uploading {local_path}: {e}")
             raise
+
+    async def _url_is_public(self, url: str) -> bool:
+        """Check if a URL is publicly accessible via a lightweight HEAD request."""
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.head(url, allow_redirects=True) as resp:
+                    return 200 <= resp.status < 300
+        except Exception:
+            return False
 
     async def send_webhook(self, webhook_url: str, result, extra_params: Dict = None) -> None:
         """Send webhook notification with result"""
