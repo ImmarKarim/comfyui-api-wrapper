@@ -2,7 +2,7 @@ import asyncio
 import uuid
 import logging
 import json
-from typing import Annotated, List
+from typing import Annotated, List, Optional
 from datetime import datetime
 from pathlib import Path
 
@@ -26,6 +26,8 @@ from responses.result import Result
 from workers.preprocess_worker import PreprocessWorker
 from workers.generation_worker import GenerationWorker
 from workers.postprocess_worker import PostprocessWorker
+import aiobotocore.session
+from urllib.parse import urlparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -331,6 +333,17 @@ async def generate(
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
     
+    # S3 short-circuit: if outputs already exist for this request_id, return immediately
+    try:
+        cached_result = await _check_existing_outputs_in_s3(request_id, payload)
+        if cached_result:
+            await response_store.set(request_id, cached_result)
+            logger.info(f"Short-circuit: returning existing outputs for {request_id} from S3")
+            response.status_code = 200
+            return cached_result
+    except Exception as e:
+        logger.warning(f"S3 short-circuit check failed for {request_id}: {e}")
+
     result_pending = Result(id=request_id)
 
     try:
@@ -435,6 +448,16 @@ async def generate_sync(
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
 
+    # S3 short-circuit: if outputs already exist for this request_id, return immediately
+    try:
+        cached_result = await _check_existing_outputs_in_s3(request_id, payload)
+        if cached_result:
+            await response_store.set(request_id, cached_result)
+            logger.info(f"Short-circuit (sync): returning existing outputs for {request_id} from S3")
+            return cached_result
+    except Exception as e:
+        logger.warning(f"S3 short-circuit check failed for {request_id}: {e}")
+
     result_pending = Result(id=request_id)
     await request_store.set(request_id, payload)
     await response_store.set(request_id, result_pending)
@@ -484,6 +507,24 @@ async def generate_stream(
         payload.input.request_id = str(uuid.uuid4())
     request_id = payload.input.request_id
     
+    # S3 short-circuit: if outputs already exist for this request_id, stream immediate completion
+    try:
+        cached_result = await _check_existing_outputs_in_s3(request_id, payload)
+        if cached_result:
+            await response_store.set(request_id, cached_result)
+            logger.info(f"Short-circuit (stream): returning existing outputs for {request_id} from S3")
+            return StreamingResponse(
+                _stream_status_updates(request_id),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no"
+                }
+            )
+    except Exception as e:
+        logger.warning(f"S3 short-circuit check failed for {request_id}: {e}")
+
     result_pending = Result(id=request_id)
 
     try:
@@ -880,3 +921,134 @@ async def check_comfyui_health() -> dict:
             "websocket_ok": False,
             "message": f"HTTP error: {str(e)}"
         }
+
+
+# ===== S3 SHORT-CIRCUIT HELPER =====
+async def _check_existing_outputs_in_s3(request_id: str, payload: Payload) -> Optional[Result]:
+    """If S3 has objects under request_id/, return a completed Result with URLs and skip processing.
+
+    Returns a Result or None if no existing outputs were found or S3 is not configured.
+    """
+    # Resolve S3 configuration from payload first, then environment
+    try:
+        # Lazy import to avoid hard dependency when unused
+        from config import S3_ENABLED, S3_CONFIG
+    except Exception:
+        return None
+
+    s3_config: Optional[dict] = None
+    try:
+        if hasattr(payload, 'input') and getattr(payload.input, 's3', None):
+            cfg = payload.input.s3.get_config()
+            if cfg.get("access_key_id") and cfg.get("secret_access_key") and cfg.get("bucket_name"):
+                s3_config = cfg
+        if not s3_config and S3_ENABLED:
+            s3_config = S3_CONFIG.copy()
+    except Exception:
+        s3_config = None
+
+    if not s3_config:
+        return None
+
+    access_key = s3_config.get("access_key_id")
+    secret_key = s3_config.get("secret_access_key")
+    endpoint_url = s3_config.get("endpoint_url")
+    bucket = s3_config.get("bucket_name")
+    region = s3_config.get("region")
+    if not (access_key and secret_key and bucket):
+        return None
+
+    session = aiobotocore.session.get_session()
+    client_kwargs = {
+        "aws_access_key_id": access_key,
+        "aws_secret_access_key": secret_key,
+    }
+    if endpoint_url:
+        client_kwargs["endpoint_url"] = endpoint_url
+    if region:
+        client_kwargs["region_name"] = region
+
+    prefix = f"{request_id}/"
+
+    # Prefer common media types first
+    preferred_exts = (".mp4", ".gif", ".png", ".jpg", ".jpeg", ".webp")
+
+    try:
+        async with session.create_client("s3", **client_kwargs) as s3_client:
+            resp = await s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=100)
+            contents = resp.get("Contents") or []
+            if not contents:
+                return None
+
+            # Sort keys with preferred extensions first, then by LastModified descending
+            def pref_rank(key: str) -> int:
+                for idx, ext in enumerate(preferred_exts):
+                    if key.lower().endswith(ext):
+                        return idx
+                return len(preferred_exts)
+
+            items = []
+            for obj in contents:
+                key = obj.get("Key") or ""
+                if not key or key.endswith("/"):
+                    continue
+                items.append({
+                    "Key": key,
+                    "LastModified": obj.get("LastModified"),
+                    "Rank": pref_rank(key)
+                })
+
+            if not items:
+                return None
+
+            items.sort(key=lambda x: (x["Rank"], x["LastModified"] or 0), reverse=False)
+
+            # Generate URLs, preferring permanent public URLs when accessible
+            output_objs = []
+            for it in items:
+                key = it["Key"]
+                presigned_url = await s3_client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": bucket, "Key": key},
+                    ExpiresIn=604800
+                )
+                filename = key.split("/")[-1]
+                # Attempt to derive a public direct URL by stripping query params
+                direct_url = None
+                try:
+                    parsed = urlparse(presigned_url)
+                    candidate = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+                    if await _url_is_public(candidate):
+                        direct_url = candidate
+                except Exception:
+                    direct_url = None
+                output_objs.append({
+                    "filename": filename,
+                    "url": direct_url or presigned_url,
+                    "type": "file",
+                    "subfolder": request_id,
+                    "node_id": "",
+                    "output_type": "s3"
+                })
+
+            result = Result(
+                id=request_id,
+                status="completed",
+                message="Outputs already exist in S3; returning cached URLs",
+                output=output_objs
+            )
+            return result
+    except Exception as e:
+        logger.debug(f"S3 short-circuit error for {request_id}: {e}")
+        return None
+
+
+async def _url_is_public(url: str) -> bool:
+    """Lightweight HEAD to check if a direct URL is publicly accessible."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=5)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.head(url, allow_redirects=True) as resp:
+                return 200 <= resp.status < 400
+    except Exception:
+        return False
