@@ -82,6 +82,10 @@ class Input(BaseModel):
     workflow_json: Dict = Field(default_factory=dict)
     s3: Optional[S3Config] = Field(default=None)
     webhook: Optional[WebHook] = Field(default=None)
+    compression: bool = Field(
+        default=False,
+        description="Enable JPEG compression to reduce file size (~85% reduction) and strip metadata for security"
+    )
     
     @model_validator(mode='after')
     def validate_workflow_mode(self):

@@ -14,6 +14,7 @@ import aiofiles.os
 import aiohttp
 
 from config import OUTPUT_DIR, S3_CONFIG, S3_ENABLED, WEBHOOK_CONFIG, WEBHOOK_ENABLED
+from utils.image_compression import compress_image_file_async
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,10 @@ class PostprocessWorker:
                     
                     # Move generated assets to organized directory
                     await self.move_assets(request_id, result)
+                    
+                    # Compress images if requested (before S3 upload to save bandwidth/storage)
+                    if hasattr(request.input, 'compression') and request.input.compression:
+                        await self.compress_assets(request_id, result)
                     
                     # Handle S3 upload - check payload first, then environment variables
                     s3_config = await self.get_s3_config(request.input)
@@ -222,6 +227,112 @@ class PostprocessWorker:
             
         except Exception as e:
             logger.error(f"Error moving assets for {request_id}: {e}", exc_info=True)
+            raise
+
+    async def compress_assets(self, request_id: str, result) -> None:
+        """
+        Compress image assets to JPEG format for cost savings and security.
+        
+        This reduces file sizes by ~85% (e.g., 5MB → 800KB) while maintaining visual quality.
+        Also strips metadata to prevent reverse-engineering of ComfyUI workflows.
+        
+        Args:
+            request_id: The request ID
+            result: Result object containing output files
+        """
+        if not hasattr(result, 'output') or not result.output:
+            logger.info(f"No assets to compress for {request_id}")
+            return
+        
+        try:
+            logger.info(f"Starting compression for {len(result.output)} file(s) in {request_id}")
+            
+            # Compress all image files concurrently
+            tasks = []
+            for i, obj in enumerate(result.output):
+                local_path = obj.get("local_path")
+                
+                if not local_path or not Path(local_path).exists():
+                    logger.warning(f"Skipping compression for missing file: {local_path}")
+                    tasks.append(asyncio.create_task(self._return_none()))
+                    continue
+                
+                # Only compress image files (skip videos, gifs, etc.)
+                file_path = Path(local_path)
+                if file_path.suffix.lower() not in ['.png', '.jpg', '.jpeg', '.webp', '.tiff', '.bmp']:
+                    logger.debug(f"Skipping non-image file: {file_path.name}")
+                    tasks.append(asyncio.create_task(self._return_none()))
+                    continue
+                
+                # Create compression task
+                task = asyncio.create_task(self._compress_single_file(file_path, obj, i))
+                tasks.append(task)
+            
+            # Wait for all compressions to complete
+            if tasks:
+                compression_results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Update result objects with compressed file info
+                success_count = 0
+                for obj, compress_result in zip(result.output, compression_results):
+                    if isinstance(compress_result, Exception):
+                        logger.error(f"Compression failed for {obj.get('local_path')}: {compress_result}")
+                        obj["compression_error"] = str(compress_result)
+                    elif compress_result:
+                        # Update the local_path and filename to point to compressed file
+                        obj["local_path"] = str(compress_result["compressed_path"])
+                        obj["filename"] = compress_result["compressed_path"].name
+                        obj["original_size"] = compress_result["original_size"]
+                        obj["compressed_size"] = compress_result["compressed_size"]
+                        obj["compression_ratio"] = compress_result["compression_ratio"]
+                        success_count += 1
+                
+                logger.info(
+                    f"Compression complete for {request_id}: "
+                    f"{success_count}/{len(result.output)} files compressed successfully"
+                )
+        
+        except Exception as e:
+            logger.error(f"Error during compression for {request_id}: {e}", exc_info=True)
+            # Don't raise - compression failures shouldn't fail the whole job
+            # The original files will still be uploaded
+
+    async def _compress_single_file(self, file_path: Path, obj: Dict, index: int) -> Optional[Dict]:
+        """
+        Compress a single image file.
+        
+        Returns:
+            Dict with compression results or None if skipped
+        """
+        try:
+            original_size = file_path.stat().st_size
+            
+            logger.debug(f"Compressing file {index}: {file_path.name} ({original_size / 1024:.1f}KB)")
+            
+            # Compress the image (replaces original with JPEG version)
+            compressed_path = await compress_image_file_async(
+                input_path=file_path,
+                replace_original=True  # Replace original to save disk space
+            )
+            
+            compressed_size = compressed_path.stat().st_size
+            compression_ratio = (1 - compressed_size / original_size) * 100 if original_size > 0 else 0
+            
+            logger.info(
+                f"Compressed {file_path.name}: "
+                f"{original_size / 1024:.1f}KB → {compressed_size / 1024:.1f}KB "
+                f"({compression_ratio:.1f}% reduction)"
+            )
+            
+            return {
+                "compressed_path": compressed_path,
+                "original_size": original_size,
+                "compressed_size": compressed_size,
+                "compression_ratio": compression_ratio
+            }
+            
+        except Exception as e:
+            logger.error(f"Failed to compress {file_path}: {e}")
             raise
 
     async def _process_output_file(self, item: Dict, job_output_dir: Path, request_id: str, node_id: str, output_type: str) -> Optional[Dict]:
