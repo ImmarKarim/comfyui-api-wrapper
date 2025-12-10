@@ -11,7 +11,6 @@ from fastapi.responses import Response, StreamingResponse, HTMLResponse, JSONRes
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from contextlib import asynccontextmanager
-from anyio import create_task_group
 
 from aiocache import Cache, SimpleMemoryCache
 import time
@@ -366,72 +365,79 @@ async def generate(
         return failed_result
 
 # ===== SYNCHRONOUS ENDPOINT =====
-class DisconnectWithWebhook(Exception):
-    """Raised when client disconnects but webhook is configured"""
-    pass
+
+class DisconnectStatus:
+    """Tracks disconnect state and whether webhook is configured"""
+    __slots__ = ('disconnected', 'has_webhook', 'webhook_url')
+    
+    def __init__(self):
+        self.disconnected = False
+        self.has_webhook = False
+        self.webhook_url = None
 
 @asynccontextmanager
 async def cancel_on_disconnect(request: Request, request_id: str):
     """
-    Cancel work if the client disconnects prematurely.
+    Watch for client disconnect while processing.
     
     IMPORTANT: If webhook is configured, DON'T cancel - continue processing
     and send results via webhook.
+    
+    Yields a DisconnectStatus object that tracks disconnect state.
+    Uses plain asyncio.Task instead of anyio TaskGroup to avoid ExceptionGroup issues.
     """
-    async with create_task_group() as tg:
-        async def watch_disconnect():
-            try:
-                while True:
-                    message = await request.receive()
-                    if message["type"] == "http.disconnect":
-                        client = f'{request.client.host}:{request.client.port}' if request.client else '-:-'
-                        logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}')
-                        
-                        # Check if webhook is configured in the request payload
-                        try:
-                            payload = await request_store.get(request_id)
-                            has_webhook = False
-                            
-                            if payload and hasattr(payload, 'input'):
-                                # Check if webhook is configured
-                                if hasattr(payload.input, 'webhook') and payload.input.webhook:
-                                    has_webhook = payload.input.webhook.has_valid_url()
-                            
-                            if has_webhook:
-                                # Webhook configured - DON'T cancel processing
-                                logger.info(
-                                    f'{client} - Request {request_id} disconnected but webhook configured '
-                                    f'(url: {payload.input.webhook.url}). Continuing processing, will send webhook when done.'
-                                )
-                                # Signal that we should return early with webhook message
-                                tg.cancel_scope.cancel()
-                                raise DisconnectWithWebhook(f"Client disconnected but webhook configured for {request_id}")
-                            else:
-                                # No webhook - cancel as before
-                                logger.info(f'{client} - Request {request_id} disconnected with no webhook. Cancelling processing.')
-                                await _mark_request_cancelled(request_id)
-                                tg.cancel_scope.cancel()
-                                break
-                                
-                        except DisconnectWithWebhook:
-                            # Re-raise to outer handler
-                            raise
-                        except Exception as e:
-                            # If we can't check webhook config, err on the side of cancelling
-                            logger.warning(f'Error checking webhook config for {request_id}: {e}. Cancelling to be safe.')
-                            await _mark_request_cancelled(request_id)
-                            tg.cancel_scope.cancel()
-                            break
-                            
-            except asyncio.CancelledError:
-                # Task cancelled by scope exit — swallow it
-                pass
-
-        tg.start_soon(watch_disconnect)
+    status = DisconnectStatus()
+    disconnect_task = None
+    
+    async def watch_disconnect():
+        """Background task to watch for client disconnect"""
         try:
-            yield
-        finally:
-            tg.cancel_scope.cancel()
+            while True:
+                message = await request.receive()
+                if message["type"] == "http.disconnect":
+                    status.disconnected = True
+                    client = f'{request.client.host}:{request.client.port}' if request.client else '-:-'
+                    logger.info(f'{client} - "{request.method} {request.url.path}" 499 DISCONNECTED for {request_id}')
+                    
+                    # Check if webhook is configured
+                    try:
+                        payload = await request_store.get(request_id)
+                        
+                        if payload and hasattr(payload, 'input'):
+                            if hasattr(payload.input, 'webhook') and payload.input.webhook:
+                                status.has_webhook = payload.input.webhook.has_valid_url()
+                                if status.has_webhook:
+                                    status.webhook_url = payload.input.webhook.url
+                        
+                        if status.has_webhook:
+                            logger.info(
+                                f'{client} - Request {request_id} disconnected but webhook configured '
+                                f'(url: {status.webhook_url}). Continuing processing, will send webhook when done.'
+                            )
+                        else:
+                            logger.info(f'{client} - Request {request_id} disconnected with no webhook. Cancelling processing.')
+                            await _mark_request_cancelled(request_id)
+                            
+                    except Exception as e:
+                        logger.warning(f'Error checking webhook config for {request_id}: {e}. Cancelling to be safe.')
+                        await _mark_request_cancelled(request_id)
+                    
+                    return
+        except asyncio.CancelledError:
+            # Task cancelled by scope exit — swallow it
+            pass
+    
+    try:
+        # Use plain asyncio.Task to avoid ExceptionGroup issues from anyio TaskGroup
+        disconnect_task = asyncio.create_task(watch_disconnect())
+        yield status
+    finally:
+        if disconnect_task and not disconnect_task.done():
+            disconnect_task.cancel()
+            try:
+                await disconnect_task
+            except asyncio.CancelledError:
+                pass
 
 @app.post("/generate/sync", response_model=Result, status_code=200)
 async def generate_sync(
@@ -465,32 +471,33 @@ async def generate_sync(
 
     logger.info(f"Queued synchronous request {request_id}")
 
-    try:
-        async with cancel_on_disconnect(request, request_id):
-            while True:
-                result = await response_store.get(request_id)
-                if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
-                    return result
-                await asyncio.sleep(0.5)
-
-    except DisconnectWithWebhook:
-        # Client disconnected but webhook is configured - continue processing in background
-        response.status_code = 202
-        return Result(
-            id=request_id,
-            status="accepted",
-            message="Client disconnected. Processing continues in background. Results will be sent to configured webhook."
-        )
-    except asyncio.CancelledError:
-        # Clean return instead of exception bubble
-        return JSONResponse(
-            status_code=499,
-            content=Result(
-                id=request_id,
-                status="cancelled",
-                message="Client closed connection"
-            ).__dict__,
-        )
+    async with cancel_on_disconnect(request, request_id) as disconnect_status:
+        while True:
+            # Check if client disconnected
+            if disconnect_status.disconnected:
+                if disconnect_status.has_webhook:
+                    # Webhook configured - return accepted, processing continues in background
+                    response.status_code = 202
+                    return Result(
+                        id=request_id,
+                        status="accepted",
+                        message="Client disconnected. Processing continues in background. Results will be sent to configured webhook."
+                    )
+                else:
+                    # No webhook - request was cancelled
+                    response.status_code = 499
+                    return Result(
+                        id=request_id,
+                        status="cancelled",
+                        message="Client closed connection"
+                    )
+            
+            # Check if processing completed
+            result = await response_store.get(request_id)
+            if result and result.status in ["completed", "failed", "timeout", "cancelled"]:
+                return result
+            
+            await asyncio.sleep(0.5)
 
 # ===== STREAMING ENDPOINT =====
 @app.post('/generate/stream')
