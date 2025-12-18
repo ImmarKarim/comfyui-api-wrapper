@@ -79,10 +79,12 @@ class PostprocessWorker:
                     if hasattr(result, 'comfyui_response'):
                         logger.debug(f"ComfyUI response was: {result.comfyui_response}")
 
-                # Update final status only if not already failed
-                if result.status != "failed":
+                # Update final status only if not already in a terminal state
+                if result.status not in ["failed", "cancelled"]:
                     result.status = "completed"
                     result.message = "Processing complete."
+                elif result.status == "cancelled":
+                    logger.info(f"Job {request_id} was cancelled, keeping cancelled status")
                 else:
                     logger.info(f"Job {request_id} already marked as failed, keeping failure status")
                 

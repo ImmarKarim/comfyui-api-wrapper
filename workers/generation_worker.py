@@ -55,7 +55,7 @@ class GenerationWorker:
 
                 # Check for cancellation
                 if result and getattr(result, 'status', '') == 'cancelled':
-                    logger.info(f"PreprocessWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
+                    logger.info(f"GenerationWorker {self.worker_id} skipping cancelled job: {request_id} - jumping to postprocess")
                     await self.postprocess_queue.put(request_id)
                     self.generation_queue.task_done()
                     continue
@@ -70,8 +70,10 @@ class GenerationWorker:
                 logger.info(f"Submitted job {request_id} to ComfyUI as {comfyui_job_id}")
                 
                 # Update status to show generation started
+                # Store comfyui_job_id for external cancel support
                 result.status = "generating"
                 result.message = f"Generation started (ComfyUI job: {comfyui_job_id})"
+                result.comfyui_job_id = comfyui_job_id
                 await self.response_store.set(request_id, result)
 
                 # Check if job is already complete (cached result)
@@ -118,24 +120,38 @@ class GenerationWorker:
                 logger.info(f"GenerationWorker {self.worker_id} completed job: {request_id}")
                 
             except Exception as e:
-                logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
-                # Record failure for health metrics
-                record_generation_outcome(False)
-                # Best-effort detection for unrecoverable CUDA errors even if not from websocket path
-                try:
-                    reason = _detect_cuda_unrecoverable_reason(str(e))
-                    if reason:
-                        mark_gpu_unrecoverable(reason)
-                        logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
-                except Exception:
-                    pass
+                error_message = str(e)
+                
+                # Check if this was a cancellation (not a real failure)
+                is_cancellation = "was cancelled" in error_message.lower()
+                
+                if is_cancellation:
+                    logger.info(f"GenerationWorker {self.worker_id} job {request_id} was cancelled")
+                    # Don't record cancellation as a failure for health metrics
+                else:
+                    logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
+                    # Record failure for health metrics (only for real failures)
+                    record_generation_outcome(False)
+                    # Best-effort detection for unrecoverable CUDA errors even if not from websocket path
+                    try:
+                        reason = _detect_cuda_unrecoverable_reason(error_message)
+                        if reason:
+                            mark_gpu_unrecoverable(reason)
+                            logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
+                    except Exception:
+                        pass
                 
                 try:
-                    # Update result to show failure
+                    # Update result to show failure (but don't overwrite 'cancelled' status)
                     result = await self.response_store.get(request_id)
                     if result:
-                        result.status = "failed"
-                        result.message = f"Generation failed: {str(e)}"
+                        # Only update status if not already cancelled
+                        if result.status != "cancelled":
+                            result.status = "failed"
+                            result.message = f"Generation failed: {error_message}"
+                        else:
+                            # Keep cancelled status but update message
+                            result.message = "Generation cancelled"
                         await self.response_store.set(request_id, result)
                     
                     # Send job to postprocess for cleanup

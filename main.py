@@ -560,6 +560,41 @@ async def generate_stream(
 
 # ===== HELPER FUNCTIONS =====
 
+async def _interrupt_comfyui(comfyui_job_id: str) -> bool:
+    """Send interrupt signal to ComfyUI to stop a running job.
+    
+    Returns True if interrupt was successful, False otherwise.
+    """
+    from config import COMFYUI_API_INTERRUPT
+    
+    if not COMFYUI_API_INTERRUPT:
+        logger.warning("COMFYUI_API_INTERRUPT not configured, cannot interrupt job")
+        return False
+    
+    try:
+        timeout = aiohttp.ClientTimeout(total=5.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            payload = {"prompt_id": comfyui_job_id}
+            async with session.post(
+                COMFYUI_API_INTERRUPT,
+                json=payload,
+                headers={'Content-Type': 'application/json'}
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(f"Successfully interrupted ComfyUI job {comfyui_job_id}")
+                    return True
+                else:
+                    resp_text = await resp.text()
+                    logger.warning(f"Failed to interrupt ComfyUI job {comfyui_job_id}: HTTP {resp.status} - {resp_text}")
+                    return False
+    except asyncio.TimeoutError:
+        logger.warning(f"Timeout interrupting ComfyUI job {comfyui_job_id}")
+        return False
+    except Exception as e:
+        logger.error(f"Error interrupting ComfyUI job {comfyui_job_id}: {e}")
+        return False
+
+
 async def _mark_request_cancelled(request_id: str):
     """Helper to mark a request as cancelled in the response store"""
     try:
@@ -781,7 +816,7 @@ async def cancel_request_simple(
     request_id: str,
     response: Response
 ):
-    """Cancel a request by marking it as cancelled"""
+    """Cancel a request by marking it as cancelled and interrupting ComfyUI if generating"""
     try:
         # Get the current result
         result = await response_store.get(request_id)
@@ -797,16 +832,28 @@ async def cancel_request_simple(
                 "status": result.status
             }
         
+        # If currently generating, interrupt ComfyUI
+        comfyui_interrupted = False
+        if result.status == 'generating' and result.comfyui_job_id:
+            try:
+                interrupted = await _interrupt_comfyui(result.comfyui_job_id)
+                if interrupted:
+                    comfyui_interrupted = True
+                    logger.info(f"Interrupted ComfyUI job {result.comfyui_job_id} for request {request_id}")
+            except Exception as e:
+                logger.warning(f"Failed to interrupt ComfyUI for {request_id}: {e}")
+        
         # Mark as cancelled
         result.status = "cancelled"
         result.message = "Request cancelled by client"
         await response_store.set(request_id, result)
         
-        logger.info(f"Cancelled request {request_id}")
+        logger.info(f"Cancelled request {request_id} (comfyui_interrupted={comfyui_interrupted})")
         
         return {
             "message": f"Successfully cancelled request {request_id}",
-            "status": "cancelled"
+            "status": "cancelled",
+            "comfyui_interrupted": comfyui_interrupted
         }
         
     except Exception as e:
