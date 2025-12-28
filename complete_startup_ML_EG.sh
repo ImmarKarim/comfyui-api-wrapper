@@ -1,6 +1,8 @@
 #!/bin/bash
 # Full startup script - handles everything
 
+chmod 1777 /tmp
+
 # Install system deps
 apt-get update
 apt-get install -y wget curl git libmagic1 python3-venv
