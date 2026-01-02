@@ -7,12 +7,20 @@ chmod 1777 /tmp
 apt-get update
 apt-get install -y wget curl git libmagic1 python3-venv
 
-# Clone wrapper with retry
+# Clone wrapper with retry OR pull latest if exists
 if [ ! -d /root/comfyui-api-wrapper ]; then
     for i in 1 2 3 4 5; do
         echo "Cloning repo (attempt $i)..."
         git clone https://github.com/ImmarKarim/comfyui-api-wrapper.git /root/comfyui-api-wrapper && break
         echo "Clone failed, retrying in 5s..."
+        sleep 5
+    done
+else
+    cd /root/comfyui-api-wrapper
+    for i in 1 2 3 4 5; do
+        echo "Pulling latest wrapper changes (attempt $i)..."
+        git pull && break
+        echo "Git pull failed, retrying in 5s..."
         sleep 5
     done
 fi
