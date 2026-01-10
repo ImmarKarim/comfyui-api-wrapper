@@ -7,7 +7,7 @@ import random
 from typing import Optional, Dict, Any
 from datetime import datetime
 
-from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_WEBSOCKET
+from config import COMFYUI_API_PROMPT, COMFYUI_API_HISTORY, COMFYUI_API_INTERRUPT, COMFYUI_API_FREE, COMFYUI_API_WEBSOCKET
 from metrics import record_generation_outcome, mark_gpu_unrecoverable
 
 logger = logging.getLogger(__name__)
@@ -130,16 +130,30 @@ class GenerationWorker:
                     # Don't record cancellation as a failure for health metrics
                 else:
                     logger.error(f"GenerationWorker {self.worker_id} failed job {request_id}: {e}")
-                    # Record failure for health metrics (only for real failures)
-                    record_generation_outcome(False)
-                    # Best-effort detection for unrecoverable CUDA errors even if not from websocket path
-                    try:
-                        reason = _detect_cuda_unrecoverable_reason(error_message)
-                        if reason:
-                            mark_gpu_unrecoverable(reason)
-                            logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
-                    except Exception:
-                        pass
+                    
+                    # Check if this is an OOM error - attempt recovery
+                    is_oom = _detect_oom_error(error_message)
+                    if is_oom:
+                        logger.warning(f"OOM error detected for job {request_id} - attempting recovery via /free")
+                        recovery_success = await _attempt_oom_recovery()
+                        if recovery_success:
+                            logger.info(f"OOM recovery successful - instance remains healthy")
+                            # Record as failure but don't mark GPU as unrecoverable
+                            record_generation_outcome(False)
+                        else:
+                            logger.error(f"OOM recovery failed - recording as generation failure")
+                            record_generation_outcome(False)
+                    else:
+                        # Not OOM - record failure and check for unrecoverable CUDA errors
+                        record_generation_outcome(False)
+                        # Best-effort detection for unrecoverable CUDA errors
+                        try:
+                            reason = _detect_cuda_unrecoverable_reason(error_message)
+                            if reason:
+                                mark_gpu_unrecoverable(reason)
+                                logger.error(f"Marked GPU as unrecoverable due to error: {reason}")
+                        except Exception:
+                            pass
                 
                 try:
                     # Update result to show failure (but don't overwrite 'cancelled' status)
@@ -722,24 +736,62 @@ class GenerationWorker:
         except Exception as e:
             logger.error(f"Error cancelling ComfyUI job {comfyui_job_id}: {e}")
             return False
+def _detect_oom_error(text: str) -> bool:
+    """Detects Out of Memory errors that are recoverable via /free.
+    
+    OOM is different from fatal CUDA errors - the GPU is still healthy,
+    just ran out of VRAM. We can recover by unloading models.
+    
+    Returns True if OOM is detected.
+    """
+    try:
+        lowered = text.lower()
+        oom_triggers = [
+            "out of memory",
+            "cuda out of memory",
+            "outofmemoryerror",
+            "failed to allocate",
+            "not enough memory",
+            "memory allocation failed",
+            "ran out of memory",
+            "insufficient memory",
+            "oom",  # Common shorthand in error messages
+        ]
+        for phrase in oom_triggers:
+            if phrase in lowered:
+                return True
+        return False
+    except Exception:
+        return False
+
+
 def _detect_cuda_unrecoverable_reason(text: str) -> str:
     """Detects CUDA launch failure or similar GPU fatal errors from text.
 
     Returns a non-empty reason string if an unrecoverable GPU issue is detected; otherwise empty string.
+    
+    NOTE: OOM errors are NOT considered unrecoverable - they can be recovered via /free.
+    This function specifically detects CUDA context corruption that requires restart.
     """
     try:
+        # First check if this is an OOM error - those are recoverable, not fatal
+        if _detect_oom_error(text):
+            return ""  # OOM is not unrecoverable
+        
         lowered = text.lower()
-        # Common strings to detect unrecoverable GPU failures
+        # Common strings to detect unrecoverable GPU failures (NOT including OOM)
         triggers = [
             "unspecified launch failure",
             "cuda error: unspecified launch failure",
-            "cuda error",
-            "cuda error: device-side assert triggered",
+            "device-side assert triggered",
             "illegal memory access",
             "cuda error: an illegal memory access was encountered",
             "triton error [cuda]",
             "cuda runtime error",
             "triton error [cuda]: unspecified launch failure",
+            "cuda error: misaligned address",
+            "cuda error: invalid device function",
+            "cuda error: invalid configuration argument",
         ]
         for phrase in triggers:
             if phrase in lowered:
@@ -747,4 +799,47 @@ def _detect_cuda_unrecoverable_reason(text: str) -> str:
         return ""
     except Exception:
         return ""
+
+
+async def _attempt_oom_recovery() -> bool:
+    """Attempt to recover from OOM by calling ComfyUI's /free endpoint.
+    
+    This unloads all models from VRAM and clears the CUDA cache,
+    allowing subsequent requests to potentially succeed.
+    
+    Returns True if recovery was successful, False otherwise.
+    """
+    if not COMFYUI_API_FREE:
+        logger.warning("COMFYUI_API_FREE not configured, cannot attempt OOM recovery")
+        return False
+    
+    try:
+        payload = {
+            "unload_models": True,
+            "free_memory": True
+        }
+        
+        timeout = aiohttp.ClientTimeout(total=30)  # Give it time to unload
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            logger.info(f"Attempting OOM recovery via {COMFYUI_API_FREE}")
+            
+            async with session.post(
+                COMFYUI_API_FREE,
+                json=payload,
+                headers={'Content-Type': 'application/json'}
+            ) as response:
+                if response.status == 200:
+                    logger.info("OOM recovery successful - models unloaded, VRAM freed")
+                    return True
+                else:
+                    response_text = await response.text()
+                    logger.warning(f"OOM recovery failed: HTTP {response.status} - {response_text}")
+                    return False
+                    
+    except asyncio.TimeoutError:
+        logger.warning("OOM recovery timed out")
+        return False
+    except Exception as e:
+        logger.error(f"OOM recovery error: {e}")
+        return False
 

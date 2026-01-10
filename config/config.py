@@ -18,6 +18,7 @@ COMFYUI_API_PROMPT = urljoin(COMFYUI_API_BASE, '/prompt')
 COMFYUI_API_QUEUE = urljoin(COMFYUI_API_BASE, '/queue')
 COMFYUI_API_HISTORY = urljoin(COMFYUI_API_BASE, '/history')
 COMFYUI_API_INTERRUPT = urljoin(COMFYUI_API_BASE, '/api/interrupt')
+COMFYUI_API_FREE = urljoin(COMFYUI_API_BASE, '/free')
 
 # WebSocket endpoint (convert http to ws, https to wss)
 COMFYUI_API_WEBSOCKET = COMFYUI_API_BASE.replace('http://', 'ws://').replace('https://', 'wss://') + '/ws'
